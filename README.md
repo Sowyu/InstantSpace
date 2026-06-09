@@ -13,6 +13,7 @@ SPACE is a lightweight and efficient macOS app that overrides the system animati
 - **Native shortcuts** — uses the standard Control + arrow key bindings
 - **Lightweight** — background menu bar app with minimal resource usage
 - **No SIP changes** — uses public Accessibility APIs only
+- **Gesture Support with trackpad** - replaces animated transition
 
 ## Install
 
