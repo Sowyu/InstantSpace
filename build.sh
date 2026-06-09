@@ -24,7 +24,11 @@ swiftc \
 
 cp "$ROOT/SPACE/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 
-"$ROOT/scripts/build-icon.sh"
+if [[ ! -f "$ROOT/SPACE/Assets/AppIcon.icns" ]]; then
+  "$ROOT/scripts/build-icon.sh"
+fi
 cp "$ROOT/SPACE/Assets/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+
+codesign --force --deep --sign - "$APP_BUNDLE"
 
 echo "Built $APP_BUNDLE"

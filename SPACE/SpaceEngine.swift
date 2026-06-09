@@ -23,6 +23,8 @@ final class SpaceEngine {
     private let kIOHIDEventTypeDockSwipe: Int32 = 23
     private let kCGSEventDockControl: Int32 = 30
     private let kCGGestureMotionHorizontal: Int32 = 1
+    private let dockControlEventType = CGEventType(rawValue: 30)!
+    private let syntheticGestureMarker: Int64 = 0x5350414345
 
     private enum GesturePhase: Int32 {
         case began = 1
@@ -33,15 +35,30 @@ final class SpaceEngine {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var predictions: [String: UInt32] = [:]
+    private var physicalSwipeHandled = false
 
     private init() {}
 
+    var isRunning: Bool {
+        guard let eventTap else { return false }
+        return CFMachPortIsValid(eventTap)
+    }
+
     func start() -> Bool {
-        guard eventTap == nil else { return true }
+        if let eventTap {
+            if CFMachPortIsValid(eventTap) {
+                CGEvent.tapEnable(tap: eventTap, enable: true)
+                return true
+            }
+            stop()
+        }
 
         let mask = CGEventMask(
             (1 << CGEventType.keyDown.rawValue)
                 | (1 << CGEventType.keyUp.rawValue)
+                | (1 << dockControlEventType.rawValue)
+                | (1 << CGEventType.tapDisabledByTimeout.rawValue)
+                | (1 << CGEventType.tapDisabledByUserInput.rawValue)
         )
 
         guard
@@ -92,10 +109,18 @@ final class SpaceEngine {
             return Unmanaged.passUnretained(event)
         }
 
+        if type == dockControlEventType {
+            return handleDockSwipe(event: event)
+        }
+
         guard type == .keyDown else {
             return Unmanaged.passUnretained(event)
         }
 
+        return handleKeyDown(event: event)
+    }
+
+    private func handleKeyDown(event: CGEvent) -> Unmanaged<CGEvent>? {
         let flags = event.flags
         guard flags.contains(.maskControl), !flags.contains(.maskCommand),
               !flags.contains(.maskAlternate), !flags.contains(.maskShift)
@@ -119,6 +144,60 @@ final class SpaceEngine {
         }
 
         _ = switchSpace(direction)
+        return nil
+    }
+
+    private func handleDockSwipe(event: CGEvent) -> Unmanaged<CGEvent>? {
+        guard isHorizontalDockSwipe(event) else {
+            return Unmanaged.passUnretained(event)
+        }
+
+        if event.getIntegerValueField(.eventSourceUserData) == syntheticGestureMarker {
+            return Unmanaged.passUnretained(event)
+        }
+
+        let phase = GesturePhase(rawValue: Int32(event.getIntegerValueField(kCGEventGesturePhase)))
+        if phase == .ended {
+            physicalSwipeHandled = false
+            return nil
+        }
+
+        guard !physicalSwipeHandled else {
+            return nil
+        }
+
+        guard shouldTriggerSwitch(phase), let direction = swipeDirection(from: event) else {
+            return nil
+        }
+
+        physicalSwipeHandled = true
+        _ = switchSpace(direction)
+        return nil
+    }
+
+    private func isHorizontalDockSwipe(_ event: CGEvent) -> Bool {
+        let eventType = event.getIntegerValueField(kCGSEventTypeField)
+        let hidType = event.getIntegerValueField(kCGEventGestureHIDType)
+        let motion = event.getIntegerValueField(kCGEventGestureSwipeMotion)
+
+        return eventType == Int64(kCGSEventDockControl)
+            && hidType == Int64(kIOHIDEventTypeDockSwipe)
+            && motion == Int64(kCGGestureMotionHorizontal)
+    }
+
+    private func shouldTriggerSwitch(_ phase: GesturePhase?) -> Bool {
+        phase == .began || phase == .changed
+    }
+
+    private func swipeDirection(from event: CGEvent) -> SpaceDirection? {
+        let velocity = event.getDoubleValueField(kCGEventGestureSwipeVelocityX)
+        if velocity > 0 { return .right }
+        if velocity < 0 { return .left }
+
+        let progress = event.getDoubleValueField(kCGEventGestureSwipeProgress)
+        if progress > 0 { return .right }
+        if progress < 0 { return .left }
+
         return nil
     }
 
@@ -161,6 +240,7 @@ final class SpaceEngine {
         guard let event = CGEvent(source: nil) else { return false }
 
         event.setIntegerValueField(kCGSEventTypeField, value: Int64(kCGSEventDockControl))
+        event.setIntegerValueField(.eventSourceUserData, value: syntheticGestureMarker)
         event.setIntegerValueField(kCGEventGestureHIDType, value: Int64(kIOHIDEventTypeDockSwipe))
         event.setIntegerValueField(kCGEventGesturePhase, value: Int64(phase.rawValue))
         event.setDoubleValueField(kCGEventGestureSwipeProgress, value: Double(progress))

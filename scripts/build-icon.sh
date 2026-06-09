@@ -9,13 +9,17 @@ SOURCE_VECTOR="$ASSETS/icon-source.svg"
 SOURCE_BASE="$ASSETS/icon-base.png"
 SOURCE="$ASSETS/icon-square.png"
 
-if [[ ! -f "$SOURCE_VECTOR" ]]; then
-  echo "Missing $SOURCE_VECTOR" >&2
+if [[ -f "$SOURCE_VECTOR" ]]; then
+  if sips -s format png "$SOURCE_VECTOR" --out "$SOURCE_BASE" >/dev/null 2>&1; then
+    sips -z 1024 1024 "$SOURCE_BASE" --out "$SOURCE" >/dev/null
+  elif [[ ! -f "$SOURCE" ]]; then
+    echo "Could not convert $SOURCE_VECTOR and $SOURCE is missing." >&2
+    exit 1
+  fi
+elif [[ ! -f "$SOURCE" ]]; then
+  echo "Missing $SOURCE_VECTOR and $SOURCE" >&2
   exit 1
 fi
-
-sips -s format png "$SOURCE_VECTOR" --out "$SOURCE_BASE" >/dev/null
-sips -z 1024 1024 "$SOURCE_BASE" --out "$SOURCE" >/dev/null
 
 rm -rf "$ICONSET"
 mkdir -p "$ICONSET"

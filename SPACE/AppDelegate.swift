@@ -4,16 +4,13 @@ import ApplicationServices
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var spaceObserver: NSObjectProtocol?
+    private var permissionAlertShown = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         setupMenuBar()
         requestAccessibilityPermission()
-
-        if !SpaceEngine.shared.start() {
-            showPermissionAlert()
-            retryEngineStart()
-        }
+        startEngineOrRetry()
 
         spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.activeSpaceDidChangeNotification,
@@ -40,7 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
         menu.addItem(
-            withTitle: "Ctrl + ← / → to switch instantly",
+            withTitle: "Swipe or Ctrl + ← / → to switch instantly",
             action: nil,
             keyEquivalent: ""
         ).isEnabled = false
@@ -73,11 +70,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = AXIsProcessTrustedWithOptions(options)
     }
 
+    private func startEngineOrRetry() {
+        if AXIsProcessTrusted() {
+            if SpaceEngine.shared.start() { return }
+        } else if !permissionAlertShown {
+            permissionAlertShown = true
+            showPermissionAlert()
+        }
+
+        retryEngineStart()
+    }
+
     private func retryEngineStart() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             guard let self else { return }
-            if SpaceEngine.shared.start() { return }
-            self.retryEngineStart()
+            if SpaceEngine.shared.isRunning { return }
+            self.startEngineOrRetry()
         }
     }
 
@@ -85,7 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = "Accessibility Permission Required"
         alert.informativeText = """
-        SPACE needs Accessibility access to intercept Ctrl + arrow keys and switch spaces instantly.
+        SPACE needs Accessibility access to intercept Space switch gestures and Ctrl + arrow keys.
 
         Open System Settings → Privacy & Security → Accessibility, enable SPACE, then relaunch.
         """
