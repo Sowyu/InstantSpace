@@ -1,0 +1,258 @@
+import ApplicationServices
+import CoreFoundation
+import Foundation
+
+enum SpaceDirection {
+    case left
+    case right
+}
+
+final class SpaceEngine {
+    static let shared = SpaceEngine()
+
+    private let gestureSpeed = 2000.0
+
+    private let kCGSEventTypeField = CGEventField(rawValue: 55)!
+    private let kCGEventGestureHIDType = CGEventField(rawValue: 110)!
+    private let kCGEventGestureSwipeMotion = CGEventField(rawValue: 123)!
+    private let kCGEventGestureSwipeProgress = CGEventField(rawValue: 124)!
+    private let kCGEventGestureSwipeVelocityX = CGEventField(rawValue: 129)!
+    private let kCGEventGestureSwipeVelocityY = CGEventField(rawValue: 130)!
+    private let kCGEventGesturePhase = CGEventField(rawValue: 132)!
+
+    private let kIOHIDEventTypeDockSwipe: Int32 = 23
+    private let kCGSEventDockControl: Int32 = 30
+    private let kCGGestureMotionHorizontal: Int32 = 1
+
+    private enum GesturePhase: Int32 {
+        case began = 1
+        case changed = 2
+        case ended = 4
+    }
+
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    private var predictions: [String: UInt32] = [:]
+
+    private init() {}
+
+    func start() -> Bool {
+        guard eventTap == nil else { return true }
+
+        let mask = CGEventMask(
+            (1 << CGEventType.keyDown.rawValue)
+                | (1 << CGEventType.keyUp.rawValue)
+        )
+
+        guard
+            let tap = CGEvent.tapCreate(
+                tap: .cgSessionEventTap,
+                place: .headInsertEventTap,
+                options: .defaultTap,
+                eventsOfInterest: mask,
+                callback: { _, type, event, userInfo in
+                    guard let userInfo else { return Unmanaged.passUnretained(event) }
+                    let engine = Unmanaged<SpaceEngine>.fromOpaque(userInfo).takeUnretainedValue()
+                    return engine.handleEvent(type: type, event: event)
+                },
+                userInfo: Unmanaged.passUnretained(self).toOpaque()
+            )
+        else {
+            return false
+        }
+
+        eventTap = tap
+        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        return true
+    }
+
+    func stop() {
+        if let tap = eventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            CFMachPortInvalidate(tap)
+            eventTap = nil
+        }
+        if let source = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+            runLoopSource = nil
+        }
+    }
+
+    func resetPredictions() {
+        predictions.removeAll()
+    }
+
+    private func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let tap = eventTap {
+                CGEvent.tapEnable(tap: tap, enable: true)
+            }
+            return Unmanaged.passUnretained(event)
+        }
+
+        guard type == .keyDown else {
+            return Unmanaged.passUnretained(event)
+        }
+
+        let flags = event.flags
+        guard flags.contains(.maskControl), !flags.contains(.maskCommand),
+              !flags.contains(.maskAlternate), !flags.contains(.maskShift)
+        else {
+            return Unmanaged.passUnretained(event)
+        }
+
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        let direction: SpaceDirection?
+        switch keyCode {
+        case 123:
+            direction = .left
+        case 124:
+            direction = .right
+        default:
+            direction = nil
+        }
+
+        guard let direction else {
+            return Unmanaged.passUnretained(event)
+        }
+
+        _ = switchSpace(direction)
+        return nil
+    }
+
+    @discardableResult
+    func switchSpace(_ direction: SpaceDirection) -> Bool {
+        var info = SpaceInfo()
+        if loadSpaceInfo(&info) {
+            let current = predictions[info.displayID] ?? info.currentIndex
+            let target = direction == .left ? current &- 1 : current &+ 1
+
+            if shouldBlockSwitch(info: info, current: current, direction: direction) {
+                return false
+            }
+
+            guard postSwitchGesture(direction) else { return false }
+            predictions[info.displayID] = target
+            return true
+        }
+
+        return postSwitchGesture(direction)
+    }
+
+    private func shouldBlockSwitch(info: SpaceInfo, current: UInt32, direction: SpaceDirection) -> Bool {
+        if info.spaceCount == 0 { return true }
+        if direction == .left { return current == 0 }
+        return current + 1 >= info.spaceCount
+    }
+
+    private func postSwitchGesture(_ direction: SpaceDirection) -> Bool {
+        let right = direction == .right
+        let progress = right ? Float.leastNormalMagnitude : -Float.leastNormalMagnitude
+        let velocity = right ? gestureSpeed : -gestureSpeed
+
+        return postDockSwipe(phase: .began, progress: progress, velocity: velocity)
+            && postDockSwipe(phase: .changed, progress: progress, velocity: velocity)
+            && postDockSwipe(phase: .ended, progress: progress, velocity: velocity)
+    }
+
+    private func postDockSwipe(phase: GesturePhase, progress: Float, velocity: Double) -> Bool {
+        guard let event = CGEvent(source: nil) else { return false }
+
+        event.setIntegerValueField(kCGSEventTypeField, value: Int64(kCGSEventDockControl))
+        event.setIntegerValueField(kCGEventGestureHIDType, value: Int64(kIOHIDEventTypeDockSwipe))
+        event.setIntegerValueField(kCGEventGesturePhase, value: Int64(phase.rawValue))
+        event.setDoubleValueField(kCGEventGestureSwipeProgress, value: Double(progress))
+        event.setIntegerValueField(kCGEventGestureSwipeMotion, value: Int64(kCGGestureMotionHorizontal))
+        event.setDoubleValueField(kCGEventGestureSwipeVelocityX, value: velocity)
+        event.setDoubleValueField(kCGEventGestureSwipeVelocityY, value: velocity)
+
+        event.post(tap: .cgSessionEventTap)
+        return true
+    }
+
+    private struct SpaceInfo {
+        var currentIndex: UInt32 = 0
+        var spaceCount: UInt32 = 0
+        var displayID: String = ""
+    }
+
+    private typealias CGSConnectionID = Int32
+    private typealias CGSSpaceID = UInt64
+    private typealias MainConnectionFn = @convention(c) () -> CGSConnectionID
+    private typealias GetActiveSpaceFn = @convention(c) (CGSConnectionID) -> CGSSpaceID
+    private typealias CopyManagedDisplaySpacesFn = @convention(c) (CGSConnectionID, CFString?) -> Unmanaged<CFArray>?
+
+    private lazy var cgsMainConnection: MainConnectionFn? = {
+        guard let symbol = dlsym(dlopen(nil, RTLD_LAZY), "CGSMainConnectionID") else { return nil }
+        return unsafeBitCast(symbol, to: MainConnectionFn.self)
+    }()
+
+    private lazy var cgsGetActiveSpace: GetActiveSpaceFn? = {
+        guard let symbol = dlsym(dlopen(nil, RTLD_LAZY), "CGSGetActiveSpace") else { return nil }
+        return unsafeBitCast(symbol, to: GetActiveSpaceFn.self)
+    }()
+
+    private lazy var cgsCopyManagedDisplaySpaces: CopyManagedDisplaySpacesFn? = {
+        guard let symbol = dlsym(dlopen(nil, RTLD_LAZY), "CGSCopyManagedDisplaySpaces") else { return nil }
+        return unsafeBitCast(symbol, to: CopyManagedDisplaySpacesFn.self)
+    }()
+
+    private func loadSpaceInfo(_ info: inout SpaceInfo) -> Bool {
+        guard let cgsMainConnection, let cgsGetActiveSpace, let cgsCopyManagedDisplaySpaces else {
+            return false
+        }
+
+        let mainConnection = cgsMainConnection()
+        guard mainConnection != 0 else { return false }
+
+        let activeSpace = cgsGetActiveSpace(mainConnection)
+        guard activeSpace != 0 else { return false }
+
+        guard let displays = cgsCopyManagedDisplaySpaces(mainConnection, nil)?.takeRetainedValue() else {
+            return false
+        }
+
+        guard let displayDict = (displays as? [NSDictionary])?.first else {
+            return false
+        }
+
+        if let identifier = displayDict["Display Identifier"] as? String {
+            info.displayID = identifier
+        }
+
+        guard let spaces = displayDict["Spaces"] as? [NSDictionary] else {
+            return false
+        }
+
+        var displayActiveSpace: CGSSpaceID = 0
+        if let currentSpace = displayDict["Current Space"] as? NSDictionary,
+           let idNumber = currentSpace["id64"] as? NSNumber
+        {
+            displayActiveSpace = idNumber.uint64Value
+        }
+
+        let targetActiveSpace = displayActiveSpace != 0 ? displayActiveSpace : activeSpace
+
+        var totalSpaces: UInt32 = 0
+        var activeIndex: UInt32 = 0
+        var foundActive = false
+
+        for space in spaces {
+            guard let idNumber = space["id64"] as? NSNumber else { continue }
+            let candidate = idNumber.uint64Value
+            if !foundActive && candidate == targetActiveSpace {
+                activeIndex = totalSpaces
+                foundActive = true
+            }
+            totalSpaces &+= 1
+        }
+
+        guard totalSpaces > 0, foundActive else { return false }
+
+        info.spaceCount = totalSpaces
+        info.currentIndex = activeIndex
+        return true
+    }
+}
