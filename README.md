@@ -14,7 +14,7 @@ SPACE is a lightweight and efficient macOS app that overrides the system animati
 - **Lightweight** — background menu bar app with minimal resource usage
 - **No SIP changes** — uses public Accessibility APIs only
 - **Gesture Support with trackpad** - replaces animated transition
-
+- **Faster Animation Support** - speeds up default animations.
 ## Install
 
 ### Option 1: Download the DMG (recommended)
