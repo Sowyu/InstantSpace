@@ -10,7 +10,18 @@ enum SpaceDirection {
 final class SpaceEngine {
     static let shared = SpaceEngine()
 
-    private let gestureSpeed = 2000.0
+    private enum Defaults {
+        static let animationEnabledKey = "animationEnabled"
+        static let animationSpeedKey = "animationSpeed"
+        static let defaultAnimationEnabled = true
+        static let defaultAnimationSpeed = 100.0
+    }
+
+    private let instantGestureSpeed = 60000.0
+    private let minimumAnimatedGestureSpeed = 1500.0
+    private let maximumAnimatedGestureSpeed = 42000.0
+    private let minimumAnimationDuration = 0.045
+    private let maximumAnimationDuration = 0.28
 
     private let kCGSEventTypeField = CGEventField(rawValue: 55)!
     private let kCGEventGestureHIDType = CGEventField(rawValue: 110)!
@@ -36,12 +47,49 @@ final class SpaceEngine {
     private var runLoopSource: CFRunLoopSource?
     private var predictions: [String: UInt32] = [:]
     private var physicalSwipeHandled = false
+    private var physicalSwipeDirection: SpaceDirection?
+    private var physicalSwipeProgress: Double = 0.0
+    private var physicalSwipeBlocked = false
+    private var animationGeneration = 0
 
-    private init() {}
+    private init() {
+        UserDefaults.standard.register(defaults: [
+            Defaults.animationEnabledKey: Defaults.defaultAnimationEnabled,
+            Defaults.animationSpeedKey: Defaults.defaultAnimationSpeed,
+        ])
+    }
 
     var isRunning: Bool {
         guard let eventTap else { return false }
         return CFMachPortIsValid(eventTap)
+    }
+
+    var animationEnabled: Bool {
+        get {
+            UserDefaults.standard.bool(forKey: Defaults.animationEnabledKey)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: Defaults.animationEnabledKey)
+            UserDefaults.standard.synchronize()
+            if !newValue {
+                cancelAnimatedSwitch()
+            }
+        }
+    }
+
+    var animationSpeed: Double {
+        get {
+            Self.clampAnimationSpeed(UserDefaults.standard.double(forKey: Defaults.animationSpeedKey))
+        }
+        set {
+            UserDefaults.standard.set(Self.clampAnimationSpeed(newValue), forKey: Defaults.animationSpeedKey)
+            UserDefaults.standard.synchronize()
+        }
+    }
+
+    func loadSavedSettings() {
+        _ = animationEnabled
+        _ = animationSpeed
     }
 
     func start() -> Bool {
@@ -55,7 +103,6 @@ final class SpaceEngine {
 
         let mask = CGEventMask(
             (1 << CGEventType.keyDown.rawValue)
-                | (1 << CGEventType.keyUp.rawValue)
                 | (1 << dockControlEventType.rawValue)
                 | (1 << CGEventType.tapDisabledByTimeout.rawValue)
                 | (1 << CGEventType.tapDisabledByUserInput.rawValue)
@@ -157,22 +204,92 @@ final class SpaceEngine {
         }
 
         let phase = GesturePhase(rawValue: Int32(event.getIntegerValueField(kCGEventGesturePhase)))
+
+        guard animationEnabled else {
+            return handleInstantDockSwipe(event: event, phase: phase)
+        }
+
+        switch phase {
+        case .began:
+            physicalSwipeDirection = swipeDirection(from: event)
+            physicalSwipeProgress = abs(event.getDoubleValueField(kCGEventGestureSwipeProgress))
+            if let direction = physicalSwipeDirection, shouldBlockSwitch(direction) {
+                physicalSwipeBlocked = true
+                return nil
+            }
+            return Unmanaged.passUnretained(event)
+
+        case .changed:
+            if physicalSwipeBlocked {
+                return nil
+            }
+
+            if let direction = swipeDirection(from: event) {
+                physicalSwipeDirection = direction
+                if shouldBlockSwitch(direction) {
+                    physicalSwipeBlocked = true
+                    return nil
+                }
+            }
+            physicalSwipeProgress = max(
+                physicalSwipeProgress,
+                abs(event.getDoubleValueField(kCGEventGestureSwipeProgress))
+            )
+            return Unmanaged.passUnretained(event)
+
+        case .ended:
+            let direction = physicalSwipeDirection ?? swipeDirection(from: event)
+            let progress = max(
+                physicalSwipeProgress,
+                abs(event.getDoubleValueField(kCGEventGestureSwipeProgress))
+            )
+            physicalSwipeDirection = nil
+            physicalSwipeProgress = 0.0
+            let blocked = physicalSwipeBlocked
+            physicalSwipeBlocked = false
+
+            if blocked {
+                return nil
+            }
+
+            guard let direction else {
+                return Unmanaged.passUnretained(event)
+            }
+
+            completeHeldSwipe(direction: direction, from: progress)
+            return nil
+
+        default:
+            return Unmanaged.passUnretained(event)
+        }
+    }
+
+    private func handleInstantDockSwipe(event: CGEvent, phase: GesturePhase?) -> Unmanaged<CGEvent>? {
         if phase == .ended {
             physicalSwipeHandled = false
             return nil
         }
 
-        guard !physicalSwipeHandled else {
-            return nil
-        }
-
-        guard shouldTriggerSwitch(phase), let direction = swipeDirection(from: event) else {
+        guard !physicalSwipeHandled, let direction = swipeDirection(from: event) else {
             return nil
         }
 
         physicalSwipeHandled = true
-        _ = switchSpace(direction)
+
+        guard !shouldBlockSwitch(direction) else {
+            return nil
+        }
+
+        _ = switchSpace(direction, animated: false)
         return nil
+    }
+
+    private func cancelAnimatedSwitch() {
+        animationGeneration &+= 1
+        physicalSwipeHandled = false
+        physicalSwipeDirection = nil
+        physicalSwipeProgress = 0.0
+        physicalSwipeBlocked = false
     }
 
     private func isHorizontalDockSwipe(_ event: CGEvent) -> Bool {
@@ -183,10 +300,6 @@ final class SpaceEngine {
         return eventType == Int64(kCGSEventDockControl)
             && hidType == Int64(kIOHIDEventTypeDockSwipe)
             && motion == Int64(kCGGestureMotionHorizontal)
-    }
-
-    private func shouldTriggerSwitch(_ phase: GesturePhase?) -> Bool {
-        phase == .began || phase == .changed
     }
 
     private func swipeDirection(from event: CGEvent) -> SpaceDirection? {
@@ -201,8 +314,43 @@ final class SpaceEngine {
         return nil
     }
 
+    private func completeHeldSwipe(direction: SpaceDirection, from progress: Double) {
+        animationGeneration &+= 1
+        let generation = animationGeneration
+        let right = direction == .right
+        let sign: Float = right ? 1.0 : -1.0
+        let velocity = right ? animatedGestureSpeed : -animatedGestureSpeed
+        let startProgress = min(0.98, max(0.02, progress))
+        let remaining = max(0.02, 1.0 - startProgress)
+        let steps = max(3, Int(ceil(14.0 * remaining)))
+        let duration = max(0.035, animationDuration * remaining)
+        let interval = duration / Double(steps)
+
+        for step in 1...steps {
+            let delay = interval * Double(step)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.animationGeneration == generation else { return }
+
+                if step == steps {
+                    _ = self.postDockSwipe(phase: .ended, progress: sign, velocity: velocity)
+                } else {
+                    let fraction = Double(step) / Double(steps)
+                    let progress = startProgress + ((1.0 - startProgress) * fraction)
+                    _ = self.postDockSwipe(phase: .changed, progress: sign * Float(progress), velocity: velocity)
+                }
+            }
+        }
+    }
+
+    private func shouldBlockSwitch(_ direction: SpaceDirection) -> Bool {
+        var info = SpaceInfo()
+        guard loadSpaceInfo(&info) else { return false }
+        let current = predictions[info.displayID] ?? info.currentIndex
+        return shouldBlockSwitch(info: info, current: current, direction: direction)
+    }
+
     @discardableResult
-    func switchSpace(_ direction: SpaceDirection) -> Bool {
+    func switchSpace(_ direction: SpaceDirection, animated: Bool? = nil) -> Bool {
         var info = SpaceInfo()
         if loadSpaceInfo(&info) {
             let current = predictions[info.displayID] ?? info.currentIndex
@@ -212,12 +360,12 @@ final class SpaceEngine {
                 return false
             }
 
-            guard postSwitchGesture(direction) else { return false }
+            guard postSwitchGesture(direction, animated: animated ?? animationEnabled) else { return false }
             predictions[info.displayID] = target
             return true
         }
 
-        return postSwitchGesture(direction)
+        return postSwitchGesture(direction, animated: animated ?? animationEnabled)
     }
 
     private func shouldBlockSwitch(info: SpaceInfo, current: UInt32, direction: SpaceDirection) -> Bool {
@@ -226,14 +374,65 @@ final class SpaceEngine {
         return current + 1 >= info.spaceCount
     }
 
-    private func postSwitchGesture(_ direction: SpaceDirection) -> Bool {
+    private func postSwitchGesture(_ direction: SpaceDirection, animated: Bool) -> Bool {
         let right = direction == .right
         let progress = right ? Float.leastNormalMagnitude : -Float.leastNormalMagnitude
-        let velocity = right ? gestureSpeed : -gestureSpeed
+        let velocity = right ? instantGestureSpeed : -instantGestureSpeed
 
-        return postDockSwipe(phase: .began, progress: progress, velocity: velocity)
-            && postDockSwipe(phase: .changed, progress: progress, velocity: velocity)
-            && postDockSwipe(phase: .ended, progress: progress, velocity: velocity)
+        guard animated else {
+            return postDockSwipe(phase: .began, progress: progress, velocity: velocity)
+                && postDockSwipe(phase: .changed, progress: progress, velocity: velocity)
+                && postDockSwipe(phase: .ended, progress: progress, velocity: velocity)
+        }
+
+        return postAnimatedSwitchGesture(direction)
+    }
+
+    private func postAnimatedSwitchGesture(_ direction: SpaceDirection) -> Bool {
+        animationGeneration &+= 1
+        let generation = animationGeneration
+        let right = direction == .right
+        let sign: Float = right ? 1.0 : -1.0
+        let speed = animatedGestureSpeed
+        let velocity = right ? speed : -speed
+        let steps = 14
+        let interval = animationDuration / Double(steps)
+
+        guard postDockSwipe(phase: .began, progress: sign * Float.leastNormalMagnitude, velocity: velocity) else {
+            return false
+        }
+
+        for step in 1...steps {
+            let delay = interval * Double(step)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.animationGeneration == generation else { return }
+
+                if step == steps {
+                    _ = self.postDockSwipe(phase: .ended, progress: sign, velocity: velocity)
+                } else {
+                    let progress = sign * Float(Double(step) / Double(steps))
+                    _ = self.postDockSwipe(phase: .changed, progress: progress, velocity: velocity)
+                }
+            }
+        }
+
+        return true
+    }
+
+    private var animatedGestureSpeed: Double {
+        let normalized = animationSpeed / 100.0
+        return minimumAnimatedGestureSpeed
+            + ((maximumAnimatedGestureSpeed - minimumAnimatedGestureSpeed) * normalized)
+    }
+
+    private var animationDuration: Double {
+        let normalized = animationSpeed / 100.0
+        return maximumAnimationDuration
+            - ((maximumAnimationDuration - minimumAnimationDuration) * normalized)
+    }
+
+    private static func clampAnimationSpeed(_ speed: Double) -> Double {
+        min(100.0, max(1.0, speed))
     }
 
     private func postDockSwipe(phase: GesturePhase, progress: Float, velocity: Double) -> Bool {
