@@ -1,12 +1,7 @@
 Built by GitHub Actions from the tagged source.
 
-### Fixed
-- Swiping partway and dragging back to cancel no longer switches the wrong way or leaves the Dock stuck mid-gesture.
-- Rapid Ctrl+arrow presses and key repeat no longer drop switches. Toggling "Animate Switch" mid-animation is safe.
-- A cancelled trackpad gesture no longer makes the next swipe ignored.
-- A dropped switch no longer blocks the edge until the next real Space change.
-- Multiple displays with "Displays have separate Spaces" now use the display that has the active Space.
-- App version in Info.plist now matches the release.
+### New
+- In-app updates. The menu shows the installed version and a "Check for Updates" item. SPACE checks GitHub once a day; when a newer release exists the item becomes "Install Update", which downloads the DMG, verifies its sha256 against GitHub's digest and its code signature, swaps the app in place, and relaunches.
 
 ### Install
 1. Download `SPACE.dmg` and open it

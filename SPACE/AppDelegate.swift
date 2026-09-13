@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var animationToggleItem: NSMenuItem?
     private var speedLabel: NSTextField?
     private var speedSlider: NSSlider?
+    private var updateItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -16,6 +17,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenuBar()
         requestAccessibilityPermission()
         startEngineOrRetry()
+        Updater.shared.onStateChange = { [weak self] in self?.updateUpdateMenuState() }
+        Updater.shared.startDailyChecks()
 
         spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.activeSpaceDidChangeNotification,
@@ -41,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let menu = NSMenu()
+        menu.autoenablesItems = false
         menu.addItem(
             withTitle: "Swipe or Ctrl + ← / → to switch instantly",
             action: nil,
@@ -51,6 +55,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(makeAnimationToggleItem())
         menu.addItem(makeSpeedSliderItem())
+        menu.addItem(.separator())
+        menu.addItem(
+            withTitle: "SPACE \(Updater.shared.currentVersion)",
+            action: nil,
+            keyEquivalent: ""
+        ).isEnabled = false
+        menu.addItem(makeUpdateItem())
         menu.addItem(.separator())
         menu.addItem(
             withTitle: "Quit SPACE",
@@ -86,6 +97,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func speedSliderChanged(_ sender: NSSlider) {
         SpaceEngine.shared.animationSpeed = sender.doubleValue
         updateAnimationMenuState()
+    }
+
+    @objc private func updateAction() {
+        if case .available = Updater.shared.state {
+            Updater.shared.install()
+        } else {
+            Updater.shared.check(interactive: true)
+        }
+    }
+
+    private func makeUpdateItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "", action: #selector(updateAction), keyEquivalent: "")
+        item.target = self
+        updateItem = item
+        updateUpdateMenuState()
+        return item
+    }
+
+    private func updateUpdateMenuState() {
+        switch Updater.shared.state {
+        case .idle:
+            updateItem?.title = "Check for Updates\u{2026}"
+            updateItem?.isEnabled = true
+        case .checking:
+            updateItem?.title = "Checking for Updates\u{2026}"
+            updateItem?.isEnabled = false
+        case .available(let release):
+            updateItem?.title = "Install Update \(release.version)"
+            updateItem?.isEnabled = true
+        case .installing:
+            updateItem?.title = "Installing Update\u{2026}"
+            updateItem?.isEnabled = false
+        }
     }
 
     private func makeLaunchAtLoginItem() -> NSMenuItem {

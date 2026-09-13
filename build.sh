@@ -34,6 +34,7 @@ swiftc \
   "$ROOT/SPACE/main.swift" \
   "$ROOT/SPACE/AppDelegate.swift" \
   "$ROOT/SPACE/SpaceEngine.swift" \
+  "$ROOT/SPACE/Updater.swift" \
   -framework AppKit \
   -framework ApplicationServices \
   -framework CoreFoundation \
