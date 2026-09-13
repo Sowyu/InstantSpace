@@ -1,7 +1,7 @@
 Built by GitHub Actions from the tagged source.
 
-### New
-- In-app updates. The menu shows the installed version and a "Check for Updates" item. SPACE checks GitHub once a day; when a newer release exists the item becomes "Install Update", which downloads the DMG, verifies its sha256 against GitHub's digest and its code signature, swaps the app in place, and relaunches.
+### Fixed
+- Releases are now signed with one stable certificate, so updating no longer drops the Accessibility permission. You will need to grant it one final time after installing this version.
 
 ### Install
 1. Download `SPACE.dmg` and open it

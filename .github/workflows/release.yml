@@ -15,12 +15,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Import signing certificate
+        env:
+          P12_BASE64: ${{ secrets.SIGNING_CERT_P12 }}
+          P12_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          if [ -z "$P12_BASE64" ]; then
+            echo "SIGNING_CERT_P12 secret not set; falling back to ad-hoc signing" >&2
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p "" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "" "$KEYCHAIN"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain signing/space-release.crt
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          echo "SIGN_IDENTITY=SPACE Release Signing" >> "$GITHUB_ENV"
+
       - name: Build DMG
         run: make dmg
 
       - name: Verify bundle
         run: |
           codesign --verify --verbose build/SPACE.app
+          codesign -d -r- build/SPACE.app 2>&1 | grep designated
           plutil -p build/SPACE.app/Contents/Info.plist | grep -E 'CFBundle(Short)?Version'
 
       - uses: actions/upload-artifact@v4
