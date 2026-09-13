@@ -19,7 +19,7 @@ SPACE is a lightweight and efficient macOS app that overrides the system animati
 
 ### Option 1: Download the DMG (recommended)
 
-1. Download `SPACE.dmg` from [Releases](https://github.com/YOUR_USERNAME/SPACE/releases)
+1. Download `SPACE.dmg` from [Releases](https://github.com/Sowyu/InstantSpace/releases)
 2. Open the DMG
 3. Drag **SPACE** into **Applications**
 4. Launch SPACE from Applications
@@ -28,7 +28,7 @@ SPACE is a lightweight and efficient macOS app that overrides the system animati
 ### Option 2: Build from source
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/SPACE.git
+git clone https://github.com/Sowyu/InstantSpace.git
 cd SPACE
 make dmg
 open dist/SPACE.dmg

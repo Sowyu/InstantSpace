@@ -10,7 +10,7 @@ run: build
 	open $(APP)
 
 install: build
-	cp -R $(APP) /Applications/
+	rm -rf /Applications/SPACE.app && cp -R $(APP) /Applications/
 
 dmg: build
 	chmod +x scripts/build-dmg.sh

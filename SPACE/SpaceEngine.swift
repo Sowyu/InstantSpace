@@ -23,6 +23,12 @@ final class SpaceEngine {
     private let minimumAnimationDuration = 0.045
     private let maximumAnimationDuration = 0.28
 
+    // ponytail: fixed thresholds, expose them in the menu if swipes snap back or commit too eagerly
+    private let commitProgress = 0.2
+    private let flickVelocity = 1000.0
+    // ponytail: predictions expire after 1.5s so a gesture the Dock dropped cannot block the edge forever
+    private let predictionLifetime = 1.5
+
     private let kCGSEventTypeField = CGEventField(rawValue: 55)!
     private let kCGEventGestureHIDType = CGEventField(rawValue: 110)!
     private let kCGEventGestureSwipeMotion = CGEventField(rawValue: 123)!
@@ -41,16 +47,20 @@ final class SpaceEngine {
         case began = 1
         case changed = 2
         case ended = 4
+        case cancelled = 8
+
+        var isTerminal: Bool { self == .ended || self == .cancelled }
     }
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var predictions: [String: UInt32] = [:]
+    private var predictionTime = Date.distantPast
     private var physicalSwipeHandled = false
-    private var physicalSwipeDirection: SpaceDirection?
     private var physicalSwipeProgress: Double = 0.0
-    private var physicalSwipeBlocked = false
     private var animationGeneration = 0
+    // A gesture the Dock has seen `began` for but no `ended` yet. Must always be finished, never abandoned.
+    private var inFlightGesture: (sign: Float, velocity: Double)?
 
     private init() {
         UserDefaults.standard.register(defaults: [
@@ -71,9 +81,7 @@ final class SpaceEngine {
         set {
             UserDefaults.standard.set(newValue, forKey: Defaults.animationEnabledKey)
             UserDefaults.standard.synchronize()
-            if !newValue {
-                cancelAnimatedSwitch()
-            }
+            finishPendingGestures()
         }
     }
 
@@ -133,6 +141,7 @@ final class SpaceEngine {
     }
 
     func stop() {
+        finishPendingGestures()
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
             CFMachPortInvalidate(tap)
@@ -209,55 +218,39 @@ final class SpaceEngine {
             return handleInstantDockSwipe(event: event, phase: phase)
         }
 
+        // Animated mode: the Dock sees the real began/changed events. Only the ended event is
+        // replaced, and only when the swipe clearly commits and is not at an edge. Every other
+        // case passes the real event through so the Dock snaps back on its own and never gets
+        // stuck mid-gesture.
         switch phase {
         case .began:
-            physicalSwipeDirection = swipeDirection(from: event)
-            physicalSwipeProgress = abs(event.getDoubleValueField(kCGEventGestureSwipeProgress))
-            if let direction = physicalSwipeDirection, shouldBlockSwitch(direction) {
-                physicalSwipeBlocked = true
-                return nil
-            }
+            finishPendingGestures()
+            physicalSwipeProgress = event.getDoubleValueField(kCGEventGestureSwipeProgress)
             return Unmanaged.passUnretained(event)
 
         case .changed:
-            if physicalSwipeBlocked {
-                return nil
-            }
-
-            if let direction = swipeDirection(from: event) {
-                physicalSwipeDirection = direction
-                if shouldBlockSwitch(direction) {
-                    physicalSwipeBlocked = true
-                    return nil
-                }
-            }
-            physicalSwipeProgress = max(
-                physicalSwipeProgress,
-                abs(event.getDoubleValueField(kCGEventGestureSwipeProgress))
-            )
+            physicalSwipeProgress = event.getDoubleValueField(kCGEventGestureSwipeProgress)
             return Unmanaged.passUnretained(event)
 
         case .ended:
-            let direction = physicalSwipeDirection ?? swipeDirection(from: event)
-            let progress = max(
-                physicalSwipeProgress,
-                abs(event.getDoubleValueField(kCGEventGestureSwipeProgress))
-            )
-            physicalSwipeDirection = nil
+            let endProgress = event.getDoubleValueField(kCGEventGestureSwipeProgress)
+            let progress = endProgress != 0 ? endProgress : physicalSwipeProgress
+            let velocity = event.getDoubleValueField(kCGEventGestureSwipeVelocityX)
             physicalSwipeProgress = 0.0
-            let blocked = physicalSwipeBlocked
-            physicalSwipeBlocked = false
 
-            if blocked {
-                return nil
-            }
-
-            guard let direction else {
+            guard let direction = swipeDirection(progress: progress, velocity: velocity),
+                  shouldCommitSwipe(progress: progress, velocity: velocity),
+                  !shouldBlockSwitch(direction)
+            else {
                 return Unmanaged.passUnretained(event)
             }
 
-            completeHeldSwipe(direction: direction, from: progress)
+            completeHeldSwipe(direction: direction, from: abs(progress))
             return nil
+
+        case .cancelled:
+            physicalSwipeProgress = 0.0
+            return Unmanaged.passUnretained(event)
 
         default:
             return Unmanaged.passUnretained(event)
@@ -265,7 +258,7 @@ final class SpaceEngine {
     }
 
     private func handleInstantDockSwipe(event: CGEvent, phase: GesturePhase?) -> Unmanaged<CGEvent>? {
-        if phase == .ended {
+        if phase?.isTerminal == true {
             physicalSwipeHandled = false
             return nil
         }
@@ -284,12 +277,17 @@ final class SpaceEngine {
         return nil
     }
 
-    private func cancelAnimatedSwitch() {
-        animationGeneration &+= 1
+    private func finishPendingGestures() {
+        finishInFlightGesture()
         physicalSwipeHandled = false
-        physicalSwipeDirection = nil
         physicalSwipeProgress = 0.0
-        physicalSwipeBlocked = false
+    }
+
+    private func finishInFlightGesture() {
+        guard let gesture = inFlightGesture else { return }
+        inFlightGesture = nil
+        animationGeneration &+= 1
+        _ = postDockSwipe(phase: .ended, progress: gesture.sign, velocity: gesture.velocity)
     }
 
     private func isHorizontalDockSwipe(_ event: CGEvent) -> Bool {
@@ -303,15 +301,25 @@ final class SpaceEngine {
     }
 
     private func swipeDirection(from event: CGEvent) -> SpaceDirection? {
-        let velocity = event.getDoubleValueField(kCGEventGestureSwipeVelocityX)
-        if velocity > 0 { return .right }
-        if velocity < 0 { return .left }
+        swipeDirection(
+            progress: event.getDoubleValueField(kCGEventGestureSwipeProgress),
+            velocity: event.getDoubleValueField(kCGEventGestureSwipeVelocityX)
+        )
+    }
 
-        let progress = event.getDoubleValueField(kCGEventGestureSwipeProgress)
+    // Progress is the signed cumulative displacement, so its sign is where the fingers are now.
+    // Velocity only decides when progress is zero.
+    private func swipeDirection(progress: Double, velocity: Double) -> SpaceDirection? {
         if progress > 0 { return .right }
         if progress < 0 { return .left }
-
+        if velocity > 0 { return .right }
+        if velocity < 0 { return .left }
         return nil
+    }
+
+    private func shouldCommitSwipe(progress: Double, velocity: Double) -> Bool {
+        abs(progress) >= commitProgress
+            || (velocity * progress > 0 && abs(velocity) >= flickVelocity)
     }
 
     private func completeHeldSwipe(direction: SpaceDirection, from progress: Double) {
@@ -320,6 +328,7 @@ final class SpaceEngine {
         let right = direction == .right
         let sign: Float = right ? 1.0 : -1.0
         let velocity = right ? animatedGestureSpeed : -animatedGestureSpeed
+        inFlightGesture = (sign, velocity)
         let startProgress = min(0.98, max(0.02, progress))
         let remaining = max(0.02, 1.0 - startProgress)
         let steps = max(3, Int(ceil(14.0 * remaining)))
@@ -332,6 +341,7 @@ final class SpaceEngine {
                 guard let self, self.animationGeneration == generation else { return }
 
                 if step == steps {
+                    self.inFlightGesture = nil
                     _ = self.postDockSwipe(phase: .ended, progress: sign, velocity: velocity)
                 } else {
                     let fraction = Double(step) / Double(steps)
@@ -342,18 +352,24 @@ final class SpaceEngine {
         }
     }
 
+    private func predictedIndex(for info: SpaceInfo) -> UInt32 {
+        if Date().timeIntervalSince(predictionTime) > predictionLifetime {
+            predictions.removeAll()
+        }
+        return predictions[info.displayID] ?? info.currentIndex
+    }
+
     private func shouldBlockSwitch(_ direction: SpaceDirection) -> Bool {
         var info = SpaceInfo()
         guard loadSpaceInfo(&info) else { return false }
-        let current = predictions[info.displayID] ?? info.currentIndex
-        return shouldBlockSwitch(info: info, current: current, direction: direction)
+        return shouldBlockSwitch(info: info, current: predictedIndex(for: info), direction: direction)
     }
 
     @discardableResult
     func switchSpace(_ direction: SpaceDirection, animated: Bool? = nil) -> Bool {
         var info = SpaceInfo()
         if loadSpaceInfo(&info) {
-            let current = predictions[info.displayID] ?? info.currentIndex
+            let current = predictedIndex(for: info)
             let target = direction == .left ? current &- 1 : current &+ 1
 
             if shouldBlockSwitch(info: info, current: current, direction: direction) {
@@ -362,6 +378,7 @@ final class SpaceEngine {
 
             guard postSwitchGesture(direction, animated: animated ?? animationEnabled) else { return false }
             predictions[info.displayID] = target
+            predictionTime = Date()
             return true
         }
 
@@ -380,6 +397,7 @@ final class SpaceEngine {
         let velocity = right ? instantGestureSpeed : -instantGestureSpeed
 
         guard animated else {
+            finishInFlightGesture()
             return postDockSwipe(phase: .began, progress: progress, velocity: velocity)
                 && postDockSwipe(phase: .changed, progress: progress, velocity: velocity)
                 && postDockSwipe(phase: .ended, progress: progress, velocity: velocity)
@@ -389,6 +407,7 @@ final class SpaceEngine {
     }
 
     private func postAnimatedSwitchGesture(_ direction: SpaceDirection) -> Bool {
+        finishInFlightGesture()
         animationGeneration &+= 1
         let generation = animationGeneration
         let right = direction == .right
@@ -401,6 +420,7 @@ final class SpaceEngine {
         guard postDockSwipe(phase: .began, progress: sign * Float.leastNormalMagnitude, velocity: velocity) else {
             return false
         }
+        inFlightGesture = (sign, velocity)
 
         for step in 1...steps {
             let delay = interval * Double(step)
@@ -408,6 +428,7 @@ final class SpaceEngine {
                 guard let self, self.animationGeneration == generation else { return }
 
                 if step == steps {
+                    self.inFlightGesture = nil
                     _ = self.postDockSwipe(phase: .ended, progress: sign, velocity: velocity)
                 } else {
                     let progress = sign * Float(Double(step) / Double(steps))
@@ -478,6 +499,11 @@ final class SpaceEngine {
         return unsafeBitCast(symbol, to: CopyManagedDisplaySpacesFn.self)
     }()
 
+    private func spaceIDs(of display: NSDictionary) -> [CGSSpaceID] {
+        guard let spaces = display["Spaces"] as? [NSDictionary] else { return [] }
+        return spaces.compactMap { ($0["id64"] as? NSNumber)?.uint64Value }
+    }
+
     private func loadSpaceInfo(_ info: inout SpaceInfo) -> Bool {
         guard let cgsMainConnection, let cgsGetActiveSpace, let cgsCopyManagedDisplaySpaces else {
             return false
@@ -489,21 +515,20 @@ final class SpaceEngine {
         let activeSpace = cgsGetActiveSpace(mainConnection)
         guard activeSpace != 0 else { return false }
 
-        guard let displays = cgsCopyManagedDisplaySpaces(mainConnection, nil)?.takeRetainedValue() else {
+        guard let displays = cgsCopyManagedDisplaySpaces(mainConnection, nil)?.takeRetainedValue() as? [NSDictionary],
+              let firstDisplay = displays.first
+        else {
             return false
         }
 
-        guard let displayDict = (displays as? [NSDictionary])?.first else {
-            return false
-        }
+        // With "Displays have separate Spaces" the active space may live on any display.
+        let displayDict = displays.first { spaceIDs(of: $0).contains(activeSpace) } ?? firstDisplay
 
         if let identifier = displayDict["Display Identifier"] as? String {
             info.displayID = identifier
         }
 
-        guard let spaces = displayDict["Spaces"] as? [NSDictionary] else {
-            return false
-        }
+        let spaces = spaceIDs(of: displayDict)
 
         var displayActiveSpace: CGSSpaceID = 0
         if let currentSpace = displayDict["Current Space"] as? NSDictionary,
@@ -514,24 +539,12 @@ final class SpaceEngine {
 
         let targetActiveSpace = displayActiveSpace != 0 ? displayActiveSpace : activeSpace
 
-        var totalSpaces: UInt32 = 0
-        var activeIndex: UInt32 = 0
-        var foundActive = false
-
-        for space in spaces {
-            guard let idNumber = space["id64"] as? NSNumber else { continue }
-            let candidate = idNumber.uint64Value
-            if !foundActive && candidate == targetActiveSpace {
-                activeIndex = totalSpaces
-                foundActive = true
-            }
-            totalSpaces &+= 1
+        guard !spaces.isEmpty, let activeIndex = spaces.firstIndex(of: targetActiveSpace) else {
+            return false
         }
 
-        guard totalSpaces > 0, foundActive else { return false }
-
-        info.spaceCount = totalSpaces
-        info.currentIndex = activeIndex
+        info.spaceCount = UInt32(spaces.count)
+        info.currentIndex = UInt32(activeIndex)
         return true
     }
 }

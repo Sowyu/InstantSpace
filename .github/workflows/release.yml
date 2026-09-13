@@ -1,0 +1,38 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build DMG
+        run: make dmg
+
+      - name: Verify bundle
+        run: |
+          codesign --verify --verbose build/SPACE.app
+          plutil -p build/SPACE.app/Contents/Info.plist | grep -E 'CFBundle(Short)?Version'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SPACE.dmg
+          path: dist/SPACE.dmg
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/SPACE.dmg \
+            --title "SPACE $GITHUB_REF_NAME" \
+            --notes-file .github/release-notes.md
